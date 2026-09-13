@@ -62,20 +62,90 @@ Dependency advisories are caught two ways, and the difference matters:
   `dependabot.yml` entry, so they cover every ecosystem Dependabot can parse.
 
   Dependabot **version updates** — routine bumps of dependencies with no
-  advisory against them — are deliberately **not** enabled. They are a
-  different trade to the one above: staying at the tip of every dependency
-  shortens the distance to a future security fix, but it also puts this
-  repository in the first wave to install any newly published release, which
-  is exactly the population a compromised-maintainer attack targets. Note that
-  neither `cargo audit` nor `pnpm audit` defends against that — they match
-  against advisory databases, and a freshly malicious release has no advisory
-  yet by construction.
+  advisory against them — are deliberately **not** enabled. Routine bumps are
+  [Renovate](.github/renovate.json)'s job instead: weekly, grouped, and
+  `rangeStrategy: "bump"` so it raises the *manifest floor* rather than only
+  the lock. Running one updater rather than two is the point; two would race
+  each other on the same manifests.
 
-  Upgrade deliberately instead: `cargo update` / `pnpm update` when there is a
-  reason to, and read what moved. If version updates are ever reinstated, they
-  should carry a cooldown (Dependabot now defaults to three days, and
-  `semver-major-days` can be set much higher) and `js/` should set pnpm's
-  `minimumReleaseAge`.
+## Release cooldown
+
+Routine updating is a different trade to the advisory gate above. Staying at
+the tip of every dependency shortens the distance to a future security fix,
+but it also puts this repository in the first wave to install any newly
+published release — exactly the population a compromised-maintainer attack
+targets. Neither `cargo audit` nor `pnpm audit` defends against that: they
+match against advisory databases, and a freshly malicious release has no
+advisory yet by construction.
+
+Age is the defence that does work there, because such releases are typically
+yanked within hours. So every routine update waits **seven days** after
+publication:
+
+- `minimumReleaseAge` in [`.github/renovate.json`](.github/renovate.json)
+  covers everything Renovate opens a PR for, Cargo and npm alike.
+- `minimum-release-age` in [`js/.npmrc`](js/.npmrc) covers the manual path —
+  `pnpm update`, `pnpm add` — which Renovate never sees. It does not affect
+  `pnpm install --frozen-lockfile`, so CI is unchanged. Needs pnpm >= 10.16.
+
+The cooldown is scoped to releases that have **no** advisory. A fix for one
+that is already public must never wait: `vulnerabilityAlerts` in the Renovate
+config sets `minimumReleaseAge: null` and `schedule: at any time`, and
+Dependabot security updates are not rate-limited at all.
+
+Manual upgrades are still expected to be deliberate — `cargo update` /
+`pnpm update` when there is a reason to, and read what moved.
+
+## Reviewed-dependency audits (cargo-vet)
+
+`cargo audit` asks "is there an advisory against this?". [`cargo
+vet`](https://mozilla.github.io/cargo-vet/) asks the complementary question:
+"has a human read this crate version's code?" — which is the only one of the
+two that can catch a malicious release on the day it ships.
+
+It is answered mostly with other people's review work. `supply-chain/config.toml`
+imports the audit sets published by Mozilla, Google, the Bytecode Alliance,
+ZCash, Embark, ISRG and Fermyon; `supply-chain/imports.lock` pins what those
+sets said, so a CI run cannot be changed by someone else editing their audits
+file. Refresh it deliberately by running `cargo vet` and committing the result.
+
+At adoption this tree was 140 crates fully audited against 603 **exemptions**.
+The exemptions are the pre-existing graph, grandfathered in by `cargo vet init`
+so the gate starts green — they are not a claim that anything was reviewed.
+The value is the ratchet on what arrives *next*: a new dependency, or a bump to
+a version nobody has audited, surfaces as a diff to `supply-chain/` instead of
+sliding in unremarked. Since `cargo vet` certifies *deltas*, a later bump of an
+already-certified crate only costs a review of the diff.
+
+The [`cargo vet` job](.github/workflows/security-audit.yml) is **non-blocking**
+(`continue-on-error`) while we learn how well the import coverage holds across
+a few Renovate cycles. Drop that line to make it a gate.
+
+## Pinning GitHub Actions
+
+Every `uses:` in [`.github/workflows`](.github/workflows) is pinned to a full
+**commit SHA**, with the human-readable tag kept as a trailing comment:
+
+```yaml
+uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+```
+
+A tag is mutable and a branch more so, so `@v4` is a promise the upstream owner
+can rewrite after the fact — the vector `tj-actions/changed-files` was used for.
+A SHA is not rewritable. This applies to *all* workflows, not only the ones
+holding credentials: a low-privilege workflow that can be made to lie is its own
+problem, and `security-audit.yml` reporting a false green is the clearest case.
+
+Two consequences worth knowing before you edit a workflow:
+
+- **Actions that infer behaviour from the ref name need an explicit input once
+  pinned.** `taiki-e/install-action@nextest` picks its tool from the tag, so
+  pinned call sites must pass `tool: nextest`. (`dtolnay/rust-toolchain` is
+  safe — its `toolchain` input defaults to `stable` independently of the ref.)
+- **Renovate maintains the pins** via `pinDigests` in
+  [`.github/renovate.json`](.github/renovate.json), updating the SHA and the
+  `# vX` comment together. Do not replace a SHA with a floating tag to "make
+  updates easier"; that is the thing being prevented.
 
 You are welcome to open a normal public issue for a dependency advisory — they
 are already public by definition.

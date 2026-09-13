@@ -1,5 +1,9 @@
 {
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "description": [
+    "Cooldown, not tip-chasing. SECURITY.md explains the trade: staying at the tip of every dependency shortens the distance to a future security fix, but puts this repo in the first wave to install any newly published release — exactly the population a compromised-maintainer attack targets. Neither `cargo audit` nor `pnpm audit` defends against that, because a freshly malicious release has no advisory yet by construction. `minimumReleaseAge` is what does: malicious versions are typically yanked within hours, so a release that has survived a week unremarked is a different risk to one published an hour ago.",
+    "js/.npmrc carries the same floor for manual `pnpm update`/`pnpm add`, which Renovate never sees."
+  ],
   "extends": [
     "config:recommended",
     ":dependencyDashboard"
@@ -13,6 +17,8 @@
     "dependencies"
   ],
   "rangeStrategy": "bump",
+  "minimumReleaseAge": "7 days",
+  "internalChecksFilter": "strict",
   "commitMessagePrefix": "chore(deps):",
   "packageRules": [
     {
@@ -83,6 +89,26 @@
         "wingfoil-wire-types"
       ],
       "enabled": false
+    },
+    {
+      "description": "Keep the SHA pins pinned. Actions are pinned to a commit SHA with a `# vX` trailer (see SECURITY.md \"Pinning GitHub Actions\"); pinDigests makes Renovate maintain both halves rather than proposing a move back to a floating tag.",
+      "matchManagers": [
+        "github-actions"
+      ],
+      "pinDigests": true,
+      "groupName": "github actions",
+      "automerge": false
     }
-  ]
+  ],
+  "vulnerabilityAlerts": {
+    "description": "A cooldown is a defence against releases with no advisory yet. It must never delay a fix for one that is already public — those go out at any time, at any age.",
+    "minimumReleaseAge": null,
+    "schedule": [
+      "at any time"
+    ],
+    "labels": [
+      "dependencies",
+      "security"
+    ]
+  }
 }

@@ -480,9 +480,22 @@ Eight rules follow from that.
 - **`--locked` in CI** (`rust-test.yml`) — the committed lock is what gets
   tested, and a manifest edit that needs a new lock entry fails loudly instead
   of being papered over in the runner.
+- **Every workflow `uses:` pinned to a commit SHA**, tag kept as a `# vX`
+  comment, maintained by Renovate's `pinDigests`. Note that pinning strips the
+  ref-name trick some actions rely on — `taiki-e/install-action` needs an
+  explicit `tool:`. See SECURITY.md "Pinning GitHub Actions".
 - **Renovate**, weekly and grouped (`.github/renovate.json`), with
   `rangeStrategy: "bump"` so it raises the *manifest floor* and not just the
   lock. Floors go stale silently; nothing else fixes that.
+- **`cargo vet`** (`supply-chain/`, non-blocking job in `security-audit.yml`) —
+  the check `cargo audit` structurally cannot be: an advisory database says
+  nothing about a release that is malicious *today*. Mostly satisfied by
+  imported audits from Mozilla, Google et al. If you add a dependency and the
+  job goes red, run `cargo vet` and commit the `supply-chain/` diff — that diff
+  is the point, so do not reach for `cargo vet add-exemption` to silence it.
+- **A seven-day release cooldown** — `minimumReleaseAge` (Renovate) and
+  `minimum-release-age` (`js/.npmrc`). Advisory fixes are exempt. See
+  SECURITY.md "Release cooldown".
 
 ### Does a dependency change need a version bump?
 

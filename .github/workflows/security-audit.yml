@@ -45,16 +45,53 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Install cargo-audit
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@37f7c5781271959fb65b6b35224e28652ff2b63d # v2
         with:
           tool: cargo-audit
 
       # No build needed — cargo-audit only reads Cargo.lock.
       - name: Audit Rust dependencies
         run: cargo audit
+
+  # Rust: the other half of the problem. `cargo audit` matches against an
+  # advisory database, so it cannot see a compromised-maintainer release —
+  # a freshly malicious version has no advisory yet by construction.
+  # `cargo vet` asks the complementary question: has a human read this crate
+  # version's code? It answers it mostly with *other people's* review work,
+  # imported from the audit sets in supply-chain/config.toml (Mozilla, Google,
+  # Bytecode Alliance, ZCash, Embark, ISRG, Fermyon).
+  #
+  # NON-BLOCKING FOR NOW (`continue-on-error`). At adoption this tree was 140
+  # crates fully audited against 603 exemptions — the exemptions are the
+  # pre-existing graph, grandfathered in by `cargo vet init` so that the gate
+  # starts green and only charges for what arrives *next*. That ratchet is the
+  # whole value: a new dependency, or a bump to a version nobody has audited,
+  # shows up here as a diff to supply-chain/ rather than sliding in unremarked.
+  #
+  # Flip this to blocking (drop `continue-on-error`) once we have watched it
+  # for a few Renovate cycles and know the import coverage holds. See
+  # SECURITY.md "Reviewed-dependency audits (cargo-vet)".
+  cargo-vet:
+    name: cargo vet
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Install cargo-vet
+        uses: taiki-e/install-action@37f7c5781271959fb65b6b35224e28652ff2b63d # v2
+        with:
+          tool: cargo-vet
+
+      # `--locked` pins the imported audits to supply-chain/imports.lock rather
+      # than refetching them, so a CI run cannot be changed by someone else
+      # editing their audits file. Refresh it deliberately with `cargo vet`.
+      - name: Vet Rust dependencies
+        run: cargo vet --locked
 
   # JavaScript: audit the wingfoil-js dependency tree. Fails on moderate+
   # advisories, matching the severities Dependabot surfaced for this package.
@@ -63,14 +100,14 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Install pnpm
-        uses: pnpm/action-setup@v4
+        uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
         with:
           version: 10
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: "22"
           cache: "pnpm"
@@ -94,9 +131,9 @@ jobs:
     timeout-minutes: 15
     if: github.event_name == 'pull_request'
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: Review dependency changes
-        uses: actions/dependency-review-action@v5
+        uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0
         with:
           fail-on-severity: moderate
           # GHSA-6w46-j5rx-g56g (pytest, vulnerable tmpdir handling) does not
