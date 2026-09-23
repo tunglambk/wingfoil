@@ -202,6 +202,22 @@ impl<T: Default> Default for HistRead<T> {
     }
 }
 
+/// Report one self-driven channel receiver as done, ending the historical run
+/// once every receiver in the graph has reported (see
+/// [`Builder::channel_total`]). A receiver reaches this only when its stream has
+/// ended *and* it has nothing buffered left to deliver, so no value is stranded.
+fn report_channel_done(
+    channel_done: &Cell<usize>,
+    channel_total: &Cell<usize>,
+    finished: &Cell<bool>,
+) {
+    let done = channel_done.get() + 1;
+    channel_done.set(done);
+    if done == channel_total.get() {
+        finished.set(true);
+    }
+}
+
 /// Incrementally drain a historical channel receiver into time-grouped
 /// look-ahead bursts — the streaming counterpart of the old block-collect.
 ///
@@ -696,13 +712,24 @@ pub struct Builder {
     /// `channel` sources carry timestamps, so they run in **both** modes:
     /// realtime (waker-driven) and historical (schedule-driven replay).
     has_channel: bool,
-    /// Set by a channel node when it receives [`Message::EndOfStream`]
-    /// (`close()`), so a realtime run ends even while a producer keeps a live
-    /// [`ChannelSender`] clone — the kernel alone only ends the run when
-    /// *every* waker clone is dropped. Mirrors legacy's per-receiver
-    /// `finished` flag (here one shared flag ends the run on any channel
-    /// close, which is the single-channel realtime case the fix targets).
+    /// Set by a channel node when its receiver reaches end-of-stream —
+    /// [`Message::EndOfStream`] (`close()`), or all senders dropped — so the run
+    /// ends even while a producer keeps a live [`ChannelSender`] clone. The
+    /// realtime arm sets it on the message (first channel to close wins, the
+    /// waker-driven model); the historical arm sets it only once *every*
+    /// self-driven receiver is done (see [`Builder::channel_done`]), because a
+    /// historical graph routinely merges several channels with different end
+    /// times and must replay the longest. Mirrors legacy's per-receiver
+    /// `finished` flag.
     finished: Rc<Cell<bool>>,
+    /// Self-driven `channel` receivers wired so far. Triggered receivers are
+    /// internal plumbing (`spawn_map`'s worker output), not data sources, and do
+    /// not count: their lifetime is the graph's, not the feed's.
+    channel_total: Rc<Cell<usize>>,
+    /// How many of those receivers have reached end-of-stream with nothing left
+    /// to deliver. The historical arm ends the run when this catches up with
+    /// [`Builder::channel_total`].
+    channel_done: Rc<Cell<usize>>,
     /// True while every node in the graph can restore itself for a re-run
     /// (see [`ResetFn`]). Cleared by nodes that hold state the engine cannot
     /// reset — `external`/`poll`/`channel` sources (their producer channels
@@ -750,6 +777,8 @@ impl Default for Builder {
             has_always: false,
             has_channel: false,
             finished: Rc::new(Cell::new(false)),
+            channel_total: Rc::new(Cell::new(0)),
+            channel_done: Rc::new(Cell::new(0)),
             re_runnable: true,
             id: NEXT_BUILDER_ID.fetch_add(1, Ordering::Relaxed),
             pending: Rc::new(RefCell::new(Vec::new())),
@@ -987,6 +1016,11 @@ impl Builder {
             }
         };
         self.has_channel = true;
+        // Only a self-driven receiver is a data source whose exhaustion can end
+        // a historical run; a triggered one is fed by the graph itself.
+        if !triggered {
+            self.channel_total.set(self.channel_total.get() + 1);
+        }
         // The receiver is drained (historical) or waker-driven (realtime) by
         // the first run; a second run would see an empty channel.
         self.re_runnable = false;
@@ -997,6 +1031,8 @@ impl Builder {
         let wrap_start = wrap.clone();
         let cs2 = cs.clone();
         let finished = self.finished.clone();
+        let channel_total = self.channel_total.clone();
+        let channel_done = self.channel_done.clone();
         self.push_node(
             trigger.map(|t| vec![t]).unwrap_or_default(),
             Activation {
@@ -1049,12 +1085,20 @@ impl Builder {
                                 // next message — legacy's caught-up
                                 // `add_callback(now)` (channel.rs:238). A closed
                                 // (eof) stream just winds down.
-                                None => {
-                                    if !state.eof {
-                                        k.schedule(idx, now);
-                                    }
-                                }
+                                None if !state.eof => k.schedule(idx, now),
+                                None => {}
                             }
+                        }
+                        // A self-driven receiver that has reached end-of-stream
+                        // with nothing left to deliver is done. The historical
+                        // run ends once every such receiver is done, so a graph
+                        // merging several channels of different lengths replays
+                        // the longest instead of stopping at the first close.
+                        // This is the historical counterpart of the realtime
+                        // arm's `Message::EndOfStream` below, which ends the run
+                        // on the first close.
+                        if !triggered && state.eof && state.groups.is_empty() {
+                            report_channel_done(&channel_done, &channel_total, &finished);
                         }
                         Ok(ticked)
                     }
@@ -1140,6 +1184,13 @@ impl Builder {
                     )?;
                     if let Some((t, _)) = state.groups.front() {
                         k.schedule(idx, *t);
+                    } else if state.eof {
+                        // An empty feed that is already closed has nothing to
+                        // deliver, but it still has to report itself done. Run
+                        // one cycle at the start instant so it does so alongside
+                        // whatever else is due then, rather than ending the run
+                        // before any node has cycled.
+                        k.schedule(idx, start_time);
                     }
                 }
                 Ok(())
@@ -2627,6 +2678,7 @@ impl Builder {
             has_always: self.has_always,
             has_channel: self.has_channel,
             finished: self.finished,
+            channel_done: self.channel_done,
             id: self.id,
             active_downs,
             passive_downs,
@@ -2738,6 +2790,9 @@ pub struct Runner {
     has_always: bool,
     has_channel: bool,
     finished: Rc<Cell<bool>>,
+    /// Historical end-of-stream bookkeeping shared with the channel nodes:
+    /// receivers reported done so far. Reset alongside [`Runner::finished`].
+    channel_done: Rc<Cell<usize>>,
     id: u64,
     /// `active_downs[i]` = nodes triggered when `i` ticks (reverse of
     /// `active_ups`). Passive edges are deliberately absent — they are read but
@@ -3058,6 +3113,7 @@ impl Runner {
             *t = false;
         }
         self.finished.set(false);
+        self.channel_done.set(0);
     }
 
     /// Select the dispatch strategy for subsequent [`run`](Runner::run)s.
