@@ -10,6 +10,15 @@ use wingfoil::channel::Message;
 use wingfoil::prelude::*;
 use wingfoil::{NanoTime, RunFor, RunMode};
 
+/// `with_time().accumulate()` on a burst source, flattened so the whole
+/// sequence compares as `(time, values)` pairs (a `Burst` is a `TinyVec`, so
+/// it is not directly comparable to a `Vec`).
+fn timed(v: Vec<(NanoTime, Burst<u64>)>) -> Vec<(NanoTime, Vec<u64>)> {
+    v.into_iter()
+        .map(|(t, b)| (t, b.iter().copied().collect()))
+        .collect()
+}
+
 /// A producer thread sends values through the channel; the graph receives
 /// them as bursts, losslessly and in order — nothing coalesced.
 #[test]
@@ -236,15 +245,11 @@ fn channel_bounded_applies_backpressure_without_changing_the_result() {
     assert_eq!(times, (1..=8).map(|i| i * 100).collect::<Vec<u64>>());
 }
 
-/// A historical `channel` that reaches end-of-stream ends the run even while
-/// another source is still scheduling (#978). The channel stops re-arming once
-/// it is exhausted, but a ticker keeps the kernel alive, so before the fix a
-/// `RunFor::Forever` run never returned and engine time walked forward until
-/// `NanoTime` overflowed.
-///
-/// Bounded by `RunFor::Cycles(500)` instead of `Forever` so the pre-fix failure
-/// is an assertion rather than a hung test job: the ticker has to stop at the
-/// channel's last value (11 ticks at 0,10,…,100) rather than run to the bound.
+/// A historical `channel` that reaches end-of-stream ends a `RunFor::Forever`
+/// run even while another source is still scheduling (#978). The exhausted
+/// receiver stops re-arming, but a ticker keeps the kernel alive, so before the
+/// fix the run never returned and engine time walked forward until `NanoTime`
+/// overflowed.
 #[test]
 fn channel_eof_ends_a_historical_run_with_another_source() {
     let period = Duration::from_nanos(10);
@@ -257,14 +262,14 @@ fn channel_eof_ends_a_historical_run_with_another_source() {
     sender.send_at(1, NanoTime::new(100));
     sender.close();
 
-    r.run(RunMode::HistoricalFrom(NanoTime::ZERO), RunFor::Cycles(500))
+    r.run(RunMode::HistoricalFrom(NanoTime::ZERO), RunFor::Forever)
         .unwrap();
 
-    let tick_times: Vec<u64> = r.value(&ticks).iter().map(|(t, _)| u64::from(*t)).collect();
+    let expected: Vec<(NanoTime, u64)> = (0..=10).map(|i| (NanoTime::new(i * 10), i + 1)).collect();
     assert_eq!(
-        tick_times,
-        (0..=10).map(|i| i * 10).collect::<Vec<u64>>(),
-        "the ticker stops when the channel ends, instead of running to the bound"
+        r.value(&ticks),
+        expected,
+        "the ticker stops at the channel's last instant, not at an overflow"
     );
     let delivered: Vec<(NanoTime, Vec<u64>)> = r
         .value(&acc)
@@ -299,21 +304,153 @@ fn historical_run_waits_for_every_channel_before_it_ends() {
     late_tx.send_at(2, NanoTime::new(30));
     late_tx.close();
 
-    r.run(RunMode::HistoricalFrom(NanoTime::ZERO), RunFor::Cycles(500))
+    r.run(RunMode::HistoricalFrom(NanoTime::ZERO), RunFor::Forever)
         .unwrap();
 
-    let tick_times: Vec<u64> = r.value(&ticks).iter().map(|(t, _)| u64::from(*t)).collect();
     assert_eq!(
-        tick_times,
-        vec![0, 10, 20, 30],
+        r.value(&ticks),
+        vec![
+            (NanoTime::new(0), 1),
+            (NanoTime::new(10), 2),
+            (NanoTime::new(20), 3),
+            (NanoTime::new(30), 4),
+        ],
         "the run outlives the first channel's close, then stops"
     );
-    assert_eq!(r.value(&early_out).len(), 1, "the early value landed");
     assert_eq!(
-        r.value(&late_out).len(),
-        1,
+        timed(r.value(&early_out)),
+        vec![(NanoTime::new(10), vec![1])],
+        "the early value lands at its own instant"
+    );
+    assert_eq!(
+        timed(r.value(&late_out)),
+        vec![(NanoTime::new(30), vec![2])],
         "the later channel's value still lands after the early one closed"
     );
+}
+
+/// A `delay` downstream of the feed is work the feed still drives, so the run
+/// must let it fire before ending. Ending at the feed's last instant instead
+/// silently drops the delayed copy of its last value.
+#[test]
+fn pending_delay_drains_before_a_historical_run_ends() {
+    let g = GraphBuilder::new();
+    let (values, sender) = g.channel::<u64>();
+    let delayed = values
+        .delay(Duration::from_nanos(50))
+        .with_time()
+        .accumulate();
+    let mut r = g.build();
+
+    sender.send_at(1, NanoTime::new(100));
+    sender.close();
+
+    r.run(RunMode::HistoricalFrom(NanoTime::ZERO), RunFor::Forever)
+        .unwrap();
+
+    let delivered: Vec<(NanoTime, Vec<u64>)> = r
+        .value(&delayed)
+        .into_iter()
+        .map(|(t, b)| (t, b.iter().copied().collect()))
+        .collect();
+    assert_eq!(
+        delivered,
+        vec![(NanoTime::new(150), vec![1])],
+        "the delayed value fires after the feed closed"
+    );
+}
+
+/// The same for a `feedback` edge. The source is scheduled a tick after the
+/// forwarder runs rather than reached through a tick edge, so it is the case
+/// that would be missed by a rule that only looked at active downstreams.
+#[test]
+fn pending_feedback_drains_before_a_historical_run_ends() {
+    let g = GraphBuilder::new();
+    let (values, sender) = g.channel::<u64>();
+    let (fed_back, sink) = g.feedback::<u64>();
+    let _loop = values
+        .collapse()
+        .delay(Duration::from_nanos(50))
+        .feedback(&sink);
+    let out = fed_back.with_time().accumulate();
+    let mut r = g.build();
+
+    sender.send_at(1, NanoTime::new(100));
+    sender.close();
+
+    r.run(RunMode::HistoricalFrom(NanoTime::ZERO), RunFor::Forever)
+        .unwrap();
+
+    assert_eq!(
+        r.value(&out),
+        vec![(NanoTime::new(151), 1)],
+        "the fed-back value still lands after the feed closed"
+    );
+}
+
+/// An explicit bound is not overridden by feed exhaustion: `RunFor::Duration`
+/// owns the stop, which is what lets a bounded backtest keep ticking after its
+/// data stops (settlement, funding, a final mark). Same graph as the `Forever`
+/// test above, opposite bound.
+#[test]
+fn explicit_duration_keeps_its_tail_after_the_data_stops() {
+    let period = Duration::from_nanos(10);
+    let g = GraphBuilder::new();
+    let (values, sender) = g.channel::<u64>();
+    let ticks = g.ticker(period).count().with_time().accumulate();
+    let recv = values.with_time().accumulate();
+    let mut r = g.build();
+
+    sender.send_at(1, NanoTime::new(20));
+    sender.close();
+
+    r.run(
+        RunMode::HistoricalFrom(NanoTime::ZERO),
+        RunFor::Duration(Duration::from_nanos(100)),
+    )
+    .unwrap();
+
+    let expected: Vec<(NanoTime, u64)> = (0..12).map(|i| (NanoTime::new(i * 10), i + 1)).collect();
+    assert_eq!(
+        r.value(&ticks),
+        expected,
+        "the ticker runs to the explicit bound, not to the last value"
+    );
+    assert_eq!(
+        timed(r.value(&recv)),
+        vec![(NanoTime::new(20), vec![1])],
+        "and the data still replays"
+    );
+}
+
+/// The same bound with the producer's sender dropped instead of closed. A
+/// disconnect is an implicit end-of-stream, and it must not end a bounded run
+/// early either.
+#[test]
+fn explicit_duration_keeps_its_tail_for_a_dropped_sender() {
+    let period = Duration::from_nanos(10);
+    let g = GraphBuilder::new();
+    let (values, sender) = g.channel::<u64>();
+    let ticks = g.ticker(period).count().with_time().accumulate();
+    let recv = values.with_time().accumulate();
+    let mut r = g.build();
+
+    sender.send_at(1, NanoTime::new(20));
+    drop(sender);
+
+    r.run(
+        RunMode::HistoricalFrom(NanoTime::ZERO),
+        RunFor::Duration(Duration::from_nanos(100)),
+    )
+    .unwrap();
+
+    let expected: Vec<(NanoTime, u64)> = (0..12).map(|i| (NanoTime::new(i * 10), i + 1)).collect();
+    assert_eq!(
+        r.value(&ticks),
+        expected,
+        "a dropped sender does not end a bounded run early"
+    );
+    assert_eq!(timed(r.value(&recv)), vec![(NanoTime::new(20), vec![1])]);
 }
 
 /// The realtime counterpart: `close()` already ended a `Forever` run through
@@ -339,26 +476,42 @@ fn channel_eof_ends_a_realtime_run_with_another_source() {
     // tick before the close is scheduling-dependent, so only the value is pinned.
 }
 
-/// An open channel is not end-of-stream: a value buffered for a much later
-/// instant must not end the run early. The channel is never pumped before its
-/// scheduled instant, so this cannot block on the producer.
+/// A receiver still open when another one drains is not done, so it cannot end
+/// the run. The second channel's sender is held open past the first close and
+/// then closed from another thread — the only way to end a `Forever` run with a
+/// genuinely open feed without hanging the test.
 #[test]
 fn open_channel_does_not_end_a_historical_run() {
-    let period = Duration::from_nanos(10);
     let g = GraphBuilder::new();
-    let (_values, sender) = g.channel::<u64>();
-    let ticks = g.ticker(period).count().with_time().accumulate();
+    let (early, early_tx) = g.channel::<u64>();
+    let (late, late_tx) = g.channel::<u64>();
+    let early_out = early.with_time().accumulate();
+    let late_out = late.with_time().accumulate();
     let mut r = g.build();
 
-    sender.send_at(1, NanoTime::new(1_000_000));
+    early_tx.send_at(1, NanoTime::new(10));
+    early_tx.close();
+    late_tx.send_at(2, NanoTime::new(30));
 
-    r.run(RunMode::HistoricalFrom(NanoTime::ZERO), RunFor::Cycles(50))
+    let producer = std::thread::spawn(move || {
+        // Long enough that the graph reaches t=30 with this sender still open.
+        std::thread::sleep(Duration::from_millis(20));
+        late_tx.close();
+    });
+
+    r.run(RunMode::HistoricalFrom(NanoTime::ZERO), RunFor::Forever)
         .unwrap();
+    producer.join().expect("producer thread");
 
     assert_eq!(
-        r.value(&ticks).len(),
-        50,
-        "the ticker runs the whole bound; the channel has not ended"
+        timed(r.value(&early_out)),
+        vec![(NanoTime::new(10), vec![1])],
+        "the early channel's value lands while the late one is still open"
+    );
+    assert_eq!(
+        timed(r.value(&late_out)),
+        vec![(NanoTime::new(30), vec![2])],
+        "the open channel's later value is replayed, so the first close did not end the run"
     );
 }
 
@@ -375,13 +528,12 @@ fn empty_closed_channel_ends_a_historical_run() {
 
     sender.close();
 
-    r.run(RunMode::HistoricalFrom(NanoTime::ZERO), RunFor::Cycles(500))
+    r.run(RunMode::HistoricalFrom(NanoTime::ZERO), RunFor::Forever)
         .unwrap();
 
-    let tick_times: Vec<u64> = r.value(&ticks).iter().map(|(t, _)| u64::from(*t)).collect();
     assert_eq!(
-        tick_times,
-        vec![0],
-        "the run ends on the first cycle, not at the bound"
+        r.value(&ticks),
+        vec![(NanoTime::ZERO, 1)],
+        "the run ends on the first cycle, not after an overflow"
     );
 }
