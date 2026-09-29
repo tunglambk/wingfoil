@@ -36,8 +36,8 @@ impl<T> Bucket<T> {
     }
 
     /// Whether any value at this instant satisfies `pred`, without consuming
-    /// it. Used by the end-of-run check to ask whether the pending callbacks
-    /// include any node a drained feed can still activate.
+    /// it. Used by the end-of-run check to ask whether any pending callback
+    /// belongs to a node that is more than a pace source.
     fn any(&self, pred: &mut impl FnMut(&T) -> bool) -> bool {
         match self {
             Bucket::One(value) => pred(value),
@@ -191,9 +191,9 @@ impl<T> TimeQueue<T> {
     /// Whether any queued value satisfies `pred`, without consuming it.
     ///
     /// Unlike [`is_empty`](Self::is_empty) this walks every pending entry, so
-    /// it is *not* a per-cycle check. Its one caller decides whether a drained
-    /// historical run still has work the feeds can drive, which is only asked
-    /// once the last channel has drained.
+    /// it is *not* a per-cycle check. Its one caller asks it only after the
+    /// last channel feed has drained, and re-asks each cycle until the
+    /// remaining non-heartbeat callbacks have run.
     pub(crate) fn any(&self, mut pred: impl FnMut(&T) -> bool) -> bool {
         if let Some((_, bucket)) = &self.front
             && bucket.any(&mut pred)

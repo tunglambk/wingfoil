@@ -208,8 +208,8 @@ impl<T: Default> Default for HistRead<T> {
 /// buffered left to deliver, so no value is stranded.
 ///
 /// Arming is not the same as ending: the run stops in
-/// [`Runner::channel_feeds_exhausted`], which also waits for the callbacks the
-/// feeds can still activate — a `delay`, a `feedback`, anything downstream — to
+/// [`Runner::only_heartbeats_remain`], which also waits for every callback with
+/// real work — a `delay`, a `feedback`, a user-defined scheduling source — to
 /// drain. It is armed only under [`RunFor::Forever`] (see the call site), so an
 /// explicitly bounded run keeps its bound.
 fn report_channel_done(
@@ -737,15 +737,9 @@ pub struct Builder {
     /// [`Builder::channel_total`] — see [`Builder::channels_done`].
     channel_done: Rc<Cell<usize>>,
     /// Armed by the last self-driven receiver to drain, but only under
-    /// [`RunFor::Forever`]. The run then stops once no callback the feeds can
-    /// still activate is pending; see [`Runner::channel_feeds_exhausted`].
+    /// [`RunFor::Forever`]. The run then stops once only heartbeat callbacks
+    /// are pending; see [`Runner::only_heartbeats_remain`].
     channels_done: Rc<Cell<bool>>,
-    /// Node indices of the self-driven `channel` receivers, and the
-    /// `feedback_send` → source edges that are not active-graph edges.
-    /// [`build`](Self::build) closes both over `active_downs` into
-    /// [`Runner::channel_fed`].
-    channel_sources: Vec<usize>,
-    feedback_reach: Vec<(usize, usize)>,
     /// True while every node in the graph can restore itself for a re-run
     /// (see [`ResetFn`]). Cleared by nodes that hold state the engine cannot
     /// reset — `external`/`poll`/`channel` sources (their producer channels
@@ -796,8 +790,6 @@ impl Default for Builder {
             channel_total: Rc::new(Cell::new(0)),
             channel_done: Rc::new(Cell::new(0)),
             channels_done: Rc::new(Cell::new(false)),
-            channel_sources: Vec::new(),
-            feedback_reach: Vec::new(),
             re_runnable: true,
             id: NEXT_BUILDER_ID.fetch_add(1, Ordering::Relaxed),
             pending: Rc::new(RefCell::new(Vec::new())),
@@ -885,11 +877,14 @@ impl Builder {
     /// # Ending a historical run
     ///
     /// A **`RunFor::Forever`** historical run ends once every self-driven
-    /// receiver in the graph has drained *and* the callbacks those feeds can
-    /// still activate have run. That second half is what keeps a `delay`, a
-    /// `feedback` or any other downstream work from being dropped the moment
-    /// the last feed closes. A `ticker` scheduling alongside does **not** hold
-    /// the run open — it is a heartbeat, not a feed — which is the fix for
+    /// receiver in the graph has drained *and* the only callbacks left pending
+    /// belong to nodes that opted into
+    /// [`Activation::heartbeat`](crate::op::Activation::heartbeat). A `delay`,
+    /// a `feedback`, a user-defined source that declares
+    /// [`Activation::SCHEDULES`](crate::op::Activation::SCHEDULES) for real
+    /// data — all of them hold the run open until their work has run. A
+    /// `ticker` opts into `heartbeat` because it only advances engine time, so
+    /// it does not, which is the fix for
     /// [#978](https://github.com/wingfoil-io/wingfoil/issues/978): before it, a
     /// `channel` + `ticker` graph under `Forever` advanced engine time until
     /// `NanoTime` overflowed.
@@ -1060,7 +1055,6 @@ impl Builder {
         // a historical run; a triggered one is fed by the graph itself.
         if !triggered {
             self.channel_total.set(self.channel_total.get() + 1);
-            self.channel_sources.push(idx);
         }
         // The receiver is drained (historical) or waker-driven (realtime) by
         // the first run; a second run would see an empty channel.
@@ -1084,6 +1078,9 @@ impl Builder {
                 schedules: !triggered,
                 threaded: true,
                 always: false,
+                // A feed carries data, so its exhaustion ends the run rather
+                // than being ignored like a heartbeat.
+                heartbeat: false,
             },
             if triggered {
                 "channel(triggered)"
@@ -2447,11 +2444,6 @@ impl Builder {
         let out = self.new_slot(T::default());
         let queue = sink.queue.clone();
         let source = sink.source;
-        // The source is not an active downstream of `src` — it is scheduled
-        // directly at `time + 1` — so record the edge for the feed-reachability
-        // closure in `build`: a feedback value read off a channel-fed chain is
-        // still work the feed drives.
-        self.feedback_reach.push((src.idx, source));
         let out_reset = out.clone();
         self.push_node(
             vec![src.idx],
@@ -2516,6 +2508,9 @@ impl Builder {
             schedules: callback_activated,
             threaded: false,
             always,
+            // A composite is whatever its interior is; it is a carrier, not a
+            // pace source, so it never opts into heartbeat on its own.
+            heartbeat: false,
         };
         self.push_node(
             active_ups,
@@ -2702,6 +2697,9 @@ impl Builder {
         let mut passive_downs: Vec<Vec<usize>> = vec![Vec::new(); n];
         let mut always_nodes: Vec<usize> = Vec::new();
         let mut is_seed: Vec<bool> = vec![false; n];
+        // Nodes that declared themselves pace sources (`Activation::heartbeat`),
+        // by index. Only these are ignored once the feeds drain.
+        let mut heartbeat: Vec<bool> = vec![false; n];
         let mut layer: Vec<usize> = vec![0; n];
         for i in 0..n {
             let mut lyr = 0usize;
@@ -2724,28 +2722,8 @@ impl Builder {
             if act.always {
                 always_nodes.push(i);
             }
+            heartbeat[i] = act.heartbeat;
             is_seed[i] = act.always || act.callback_activated();
-        }
-        // Feed reachability: the channel receivers plus everything their ticks
-        // can reach through active edges, with the `feedback_send` → source
-        // edges folded in (a feedback source is scheduled directly, so it has
-        // no active edge to follow). This is the set whose pending callbacks
-        // keep a `RunFor::Forever` historical run alive after every feed has
-        // drained; a `ticker` is not in it, so a heartbeat source can no longer
-        // spin the run past its data (see `Runner::channel_feeds_exhausted`).
-        let mut channel_fed: Vec<bool> = vec![false; n];
-        let mut stack: Vec<usize> = self.channel_sources.clone();
-        while let Some(node) = stack.pop() {
-            if std::mem::replace(&mut channel_fed[node], true) {
-                continue;
-            }
-            stack.extend(active_downs[node].iter().copied());
-            stack.extend(
-                self.feedback_reach
-                    .iter()
-                    .filter(|&&(from, _)| from == node)
-                    .map(|&(_, to)| to),
-            );
         }
         Runner {
             nodes: self.nodes,
@@ -2758,7 +2736,7 @@ impl Builder {
             finished: self.finished,
             channel_done: self.channel_done,
             channels_done: self.channels_done,
-            channel_fed,
+            heartbeat,
             id: self.id,
             active_downs,
             passive_downs,
@@ -2875,17 +2853,15 @@ pub struct Runner {
     channel_done: Rc<Cell<usize>>,
     /// Armed by the last self-driven receiver to drain, under
     /// [`RunFor::Forever`] only. See
-    /// [`channel_feeds_exhausted`](Runner::channel_feeds_exhausted).
+    /// [`only_heartbeats_remain`](Runner::only_heartbeats_remain).
     channels_done: Rc<Cell<bool>>,
-    /// `channel_fed[i]` — `i` is a channel receiver or reachable from one
-    /// through active edges (a `feedback_send` → source edge included). A
-    /// pending callback for such a node is work the feeds still drive, so a
-    /// `RunFor::Forever` historical run waits for it before ending on
-    /// [`channels_done`](Runner::channels_done). `ticker` is deliberately not
-    /// in this set: once the data is exhausted a heartbeat source must not keep
-    /// the run alive (#978). Grown by `rt_append_node` / `splice_upstream` when
-    /// the graph is mutated at runtime.
-    channel_fed: Vec<bool>,
+    /// `heartbeat[i]` — node `i` declared itself a pace source
+    /// ([`Activation::heartbeat`]), so a pending callback for it does not keep
+    /// a historical `RunFor::Forever` run alive once every feed has drained
+    /// (`channels_done`). Everything else holds the run open: a `delay`, a
+    /// `feedback`, and in particular a user-defined source that schedules real
+    /// data. Grown by `rt_append_node` when the graph is mutated at runtime.
+    heartbeat: Vec<bool>,
     id: u64,
     /// `active_downs[i]` = nodes triggered when `i` ticks (reverse of
     /// `active_ups`). Passive edges are deliberately absent — they are read but
@@ -3211,20 +3187,25 @@ impl Runner {
     }
 
     /// Whether a historical `RunFor::Forever` run has run out of work: every
-    /// self-driven channel receiver has drained *and* no callback the feeds can
-    /// still activate is pending.
+    /// self-driven channel receiver has drained *and* the only callbacks still
+    /// pending belong to nodes that opted into
+    /// [`Activation::heartbeat`](crate::op::Activation::heartbeat).
     ///
-    /// The second half is what keeps `delay`, `feedback` and anything else
-    /// scheduled downstream of a feed from being dropped the instant the feed
-    /// closes — the run waits for callbacks for nodes in
-    /// [`channel_fed`](Runner::channel_fed) to drain, and only then stops.
+    /// The second half is what keeps `delay`, `feedback`, a user-defined
+    /// scheduling source and anything else with real work from being dropped
+    /// the instant the feeds close — only a pace source like `ticker` is
+    /// ignored, and only because it says so in its activation.
     ///
-    /// A `ticker` is not channel-fed, so it does not hold the run open: that is
-    /// the #978 fix. A bounded run never reaches here — the channel node arms
-    /// [`channels_done`](Runner::channels_done) only under `Forever` — so an
-    /// explicit `RunFor::Duration` / `Cycles` tail is unaffected.
-    fn channel_feeds_exhausted(&self, kernel: &Kernel) -> bool {
-        self.channels_done.get() && !kernel.has_pending_among(&self.channel_fed)
+    /// [`channels_done`](Runner::channels_done) is armed only under `Forever`,
+    /// so a bounded run never reaches here and an explicit
+    /// `RunFor::Duration` / `Cycles` tail is unaffected.
+    ///
+    /// Cost: before the last feed drains this is one `Cell` load per cycle.
+    /// Once it drains, each loop iteration walks the pending callbacks until
+    /// the non-heartbeat ones have run — the check has to re-read the queue
+    /// because every firing node can schedule more work.
+    fn only_heartbeats_remain(&self, kernel: &Kernel) -> bool {
+        self.channels_done.get() && !kernel.has_pending_outside(&self.heartbeat)
     }
 
     /// Select the dispatch strategy for subsequent [`run`](Runner::run)s.
@@ -3296,11 +3277,11 @@ impl Runner {
         // Check `finished` *before* `begin_cycle` parks: a channel that received
         // `EndOfStream` in the previous cycle ends the run now, rather than
         // waiting for the bound while a live sender clone keeps the waker
-        // channel connected. The feed check is the historical `Forever`
-        // counterpart: it also runs *between* cycles, so the last feed's
-        // downstream callbacks drain before the run stops.
+        // channel connected. The heartbeat check is the historical `Forever`
+        // counterpart: it also runs *between* cycles, so the remaining
+        // non-heartbeat callbacks drain before the run stops.
         while !self.finished.get()
-            && !self.channel_feeds_exhausted(kernel)
+            && !self.only_heartbeats_remain(kernel)
             && kernel.begin_cycle(&mut dirty)
         {
             if let Some(e) = self.drain_cycle(
@@ -3488,7 +3469,7 @@ impl Runner {
         // exactly as the sparse drain does.
         let mut marked = vec![false; n];
         while !self.finished.get()
-            && !self.channel_feeds_exhausted(kernel)
+            && !self.only_heartbeats_remain(kernel)
             && kernel.begin_cycle(&mut dirty)
         {
             // Braced so the cycle span covers exactly what the sparse path's
@@ -3732,7 +3713,7 @@ impl Runner {
                     occupied.resize(n.div_ceil(64), 0);
                 }
                 if self.finished.get()
-                    || self.channel_feeds_exhausted(&kernel)
+                    || self.only_heartbeats_remain(&kernel)
                     || !kernel.begin_cycle(&mut dirty)
                 {
                     break;
@@ -3832,12 +3813,6 @@ impl Runner {
             self.active_downs[u].push(idx);
             lyr = lyr.max(self.layer[u] + 1);
         }
-        // A node appended under a channel-fed node is still work the feed can
-        // drive, so carry the reachability flag; an unknown upstream index
-        // counts as fed, which keeps the run alive rather than ending it early.
-        let fed = active_ups
-            .iter()
-            .any(|&u| self.channel_fed.get(u).copied().unwrap_or(true));
         for &u in &passive_ups {
             self.passive_downs[u].push(idx);
             lyr = lyr.max(self.layer[u] + 1);
@@ -3866,7 +3841,7 @@ impl Runner {
         }
         self.is_seed
             .push(activation.always || activation.callback_activated());
-        self.channel_fed.push(fed);
+        self.heartbeat.push(activation.heartbeat);
         idx
     }
 
@@ -3881,30 +3856,11 @@ impl Runner {
         if active {
             self.nodes[caller].active_ups.push(new);
             self.active_downs[new].push(caller);
-            // Splice can make a node newly reachable from a feed; propagate the
-            // flag so a drained `Forever` run keeps waiting for it.
-            if self.channel_fed.get(new).copied().unwrap_or(true) {
-                self.mark_channel_fed(caller);
-            }
         } else {
             self.nodes[caller].passive_ups.push(new);
             self.passive_downs[new].push(caller);
         }
         self.fix_layers(caller);
-    }
-
-    /// Mark `start` and everything it can reach through active edges as
-    /// feed-reachable (see [`Runner::channel_fed`]). Used by
-    /// [`splice_upstream`](Runner::splice_upstream) when a runtime splice wires
-    /// a channel-fed node under an existing one.
-    fn mark_channel_fed(&mut self, start: usize) {
-        let mut stack = vec![start];
-        while let Some(node) = stack.pop() {
-            if std::mem::replace(&mut self.channel_fed[node], true) {
-                continue;
-            }
-            stack.extend(self.active_downs[node].iter().copied());
-        }
     }
 
     /// Recompute `start`'s layer from its upstreams (active *and* passive) and

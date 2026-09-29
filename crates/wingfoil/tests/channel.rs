@@ -6,7 +6,10 @@
 
 use std::time::Duration;
 
+use wingfoil::anyhow::Result;
 use wingfoil::channel::Message;
+use wingfoil::op;
+use wingfoil::op::{Activation, Ctx, Op, Tick};
 use wingfoil::prelude::*;
 use wingfoil::{NanoTime, RunFor, RunMode};
 
@@ -17,6 +20,42 @@ fn timed(v: Vec<(NanoTime, Burst<u64>)>) -> Vec<(NanoTime, Vec<u64>)> {
     v.into_iter()
         .map(|(t, b)| (t, b.iter().copied().collect()))
         .collect()
+}
+
+/// A user-defined historical source: it declares [`Activation::SCHEDULES`]
+/// because it self-schedules real data, and it does **not** opt into
+/// [`Activation::heartbeat`]. A `channel` feed draining alongside it must not
+/// end the run (`custom_scheduling_source_outlives_the_feeds`).
+struct Replay;
+
+#[op(build = replay)]
+impl Op for Replay {
+    type Cfg = Vec<NanoTime>;
+    type State = usize;
+    type In<'a> = ();
+    type Out = u64;
+    const ACTIVATION: Activation = Activation::SCHEDULES;
+
+    fn start(cfg: &mut Vec<NanoTime>, _state: &mut usize, ctx: &mut Ctx<'_>) -> Result<()> {
+        if let Some(&first) = cfg.first() {
+            ctx.schedule(first);
+        }
+        Ok(())
+    }
+
+    fn cycle(
+        cfg: &mut Vec<NanoTime>,
+        state: &mut usize,
+        _input: (),
+        ctx: &mut Ctx<'_>,
+    ) -> Result<Tick<u64>> {
+        let index = *state;
+        *state += 1;
+        if let Some(&next) = cfg.get(index + 1) {
+            ctx.schedule(next);
+        }
+        Ok(Tick::Value(index as u64 + 1))
+    }
 }
 
 /// A producer thread sends values through the channel; the graph receives
@@ -535,5 +574,45 @@ fn empty_closed_channel_ends_a_historical_run() {
         r.value(&ticks),
         vec![(NanoTime::ZERO, 1)],
         "the run ends on the first cycle, not after an overflow"
+    );
+}
+
+/// The heartbeat rule is opt-in only. A `channel` feed ending at t=100 must not
+/// end the run while a **user-defined** source still has data to t=1000: the
+/// custom source declares `Activation::SCHEDULES` for real work, so it is not a
+/// heartbeat and holds the run open. The `ticker` alongside it is ignored, as
+/// #978 asks, but only because it opted in.
+#[test]
+fn custom_scheduling_source_outlives_the_feeds() {
+    let period = Duration::from_nanos(10);
+    let g = GraphBuilder::new();
+    let (values, sender) = g.channel::<u64>();
+    let replay_times: Vec<NanoTime> = (1..=5).map(|i| NanoTime::new(i * 200)).collect();
+    let replay = g
+        .source(|b| b.replay(replay_times))
+        .with_time()
+        .accumulate();
+    let ticks = g.ticker(period).count().with_time().accumulate();
+    let recv = values.with_time().accumulate();
+    let mut r = g.build();
+
+    sender.send_at(1, NanoTime::new(100));
+    sender.close();
+
+    r.run(RunMode::HistoricalFrom(NanoTime::ZERO), RunFor::Forever)
+        .unwrap();
+
+    assert_eq!(
+        r.value(&replay),
+        (1..=5)
+            .map(|i| (NanoTime::new(i * 200), i))
+            .collect::<Vec<_>>(),
+        "every value after the channel closed is replayed, not dropped"
+    );
+    assert_eq!(timed(r.value(&recv)), vec![(NanoTime::new(100), vec![1])]);
+    assert_eq!(
+        r.value(&ticks).last().map(|(t, _)| u64::from(*t)),
+        Some(1000),
+        "the ticker keeps the run alive through the custom source, then the run ends"
     );
 }

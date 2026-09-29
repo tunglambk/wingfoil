@@ -363,16 +363,18 @@ impl Kernel {
         self.scheduled.push(index, at);
     }
 
-    /// Whether any pending callback is for a node the caller marks in `set`
-    /// (see `Runner::channel_fed`) — the drained-feed end-of-run test. A node
-    /// index outside `set` counts as marked: only a graph mutated at runtime
-    /// can hold one, and keeping such a run alive is the safe direction.
+    /// Whether any pending callback is for a node the caller marks `false` in
+    /// `heartbeat` — the "is there work left that isn't just a pace source?"
+    /// test behind the historical end-of-run check. A node index outside
+    /// `heartbeat` counts as real work: only a graph mutated at runtime can
+    /// hold one, and keeping such a run alive is the safe direction.
     ///
-    /// This walks every pending entry, so it is off the per-cycle path; the one
-    /// caller asks it only once every channel receiver has drained.
-    pub(crate) fn has_pending_among(&self, set: &[bool]) -> bool {
+    /// This walks every pending entry, so it is not free. The one caller runs
+    /// it only after the last channel feed has drained, and only for as long as
+    /// non-heartbeat callbacks remain.
+    pub(crate) fn has_pending_outside(&self, heartbeat: &[bool]) -> bool {
         self.scheduled
-            .any(|&index| set.get(index).copied().unwrap_or(true))
+            .any(|&index| !heartbeat.get(index).copied().unwrap_or(false))
     }
 
     /// Advance to the next cycle: check the run bounds, advance engine time

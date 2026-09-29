@@ -325,8 +325,9 @@ impl GraphBuilder {
     /// on the error-then-stop shape to surface a decode failure.
     ///
     /// Because it sits on [`channel`](SourceOps::channel), a `RunFor::Forever`
-    /// historical run over this feed ends once the queued rows — and the work
-    /// they drive — have drained; a bounded run keeps its bound.
+    /// historical run over this feed ends once the queued rows — and every
+    /// callback with real work behind them — have drained; a bounded run keeps
+    /// its bound.
     #[must_use = "a dropped stream stays wired and cycles every tick, producing an unread value"]
     pub fn replay_results<T, I>(&self, rows: I) -> Stream<Burst<T>>
     where
@@ -402,12 +403,15 @@ pub trait SourceOps {
     /// # Ending a `RunFor::Forever` run
     ///
     /// Once every `channel` receiver in the graph has reached end-of-stream, a
-    /// **`RunFor::Forever`** historical run ends as soon as the work those
-    /// feeds can still drive has drained — a `delay`, a `feedback`, anything
-    /// downstream. A `ticker` scheduling alongside does not keep it alive (the
-    /// fix for [#978](https://github.com/wingfoil-io/wingfoil/issues/978)).
-    /// A **bounded** run is untouched: `RunFor::Duration` / `Cycles` own the
-    /// stop, so a bounded backtest can keep ticking past its data. See
+    /// **`RunFor::Forever`** historical run ends as soon as the only pending
+    /// callbacks are for nodes that declared
+    /// [`Activation::heartbeat`](crate::op::Activation::heartbeat) — a
+    /// `ticker`, and nothing else in the box (the fix for
+    /// [#978](https://github.com/wingfoil-io/wingfoil/issues/978)). Everything
+    /// else holds the run open until its work has run, a user-defined
+    /// `Activation::SCHEDULES` source included. A **bounded** run is untouched:
+    /// `RunFor::Duration` / `Cycles` own the stop, so a bounded backtest can
+    /// keep ticking past its data. See
     /// [`Builder::channel`](crate::interp::Builder::channel) for the mechanism.
     #[must_use = "a dropped stream stays wired and cycles every tick, producing an unread value"]
     fn channel<T: Clone + Default + 'static>(&self) -> (Stream<Burst<T>>, ChannelSender<T>);
