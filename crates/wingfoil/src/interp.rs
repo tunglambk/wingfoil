@@ -4100,6 +4100,51 @@ impl Extension<'_> {
         self.runner.rt_make_handle(idx)
     }
 
+    /// Append a `combine` of several existing sources onto the live graph — the
+    /// fan-in [`Builder::combine`] wires statically, reachable from a member
+    /// factory. It ticks from the next cycle whenever any source ticks,
+    /// gathering the current values of the sources that ticked *this* instant
+    /// into one [`Burst`] in supplied order, and stays quiet on a cycle where
+    /// none ticked.
+    ///
+    /// Sources share one type, exactly as `Builder::combine`'s do, so a member
+    /// joining streams of different types maps them to a common type first. The
+    /// gather is tick-masked: a source that did not tick this instant is absent
+    /// from the burst rather than carrying its last value.
+    pub fn combine<T>(&mut self, srcs: &[Handle<T>]) -> Handle<Burst<T>>
+    where
+        T: Clone + Default + 'static,
+    {
+        let idx = self.runner.nodes.len();
+        let indices: Vec<usize> = srcs.iter().map(|h| h.idx).collect();
+        let slots: Vec<SlotRef<T>> = srcs.iter().map(|h| self.runner.rt_slot(*h)).collect();
+        let out = self.runner.rt_new_slot(Burst::<T>::new());
+        let ticked = self.runner.ticked.clone();
+        let gathered = indices.clone();
+        let cycle: CycleFn = Box::new(move |_k| {
+            let mut burst = Burst::<T>::new();
+            {
+                let t = ticked.borrow();
+                for (i, slot) in gathered.iter().zip(slots.iter()) {
+                    if t[*i] {
+                        burst.push(slot.borrow().clone());
+                    }
+                }
+            }
+            Ok(store_tick(CombineN::<T>::emit(burst), &out))
+        });
+        self.runner.rt_append_node(
+            indices,
+            Vec::new(),
+            CombineN::<T>::ACTIVATION,
+            "combine",
+            cycle,
+            Box::new(|_| Ok(())),
+        );
+        self.appended.push(idx);
+        self.runner.rt_make_handle(idx)
+    }
+
     /// Splice `new` in as an upstream of the existing `caller`. An `active`
     /// edge re-fires `caller` whenever `new` ticks and lifts `caller`'s layer
     /// above `new` (via `fix_layers`) so dispatch order stays correct even

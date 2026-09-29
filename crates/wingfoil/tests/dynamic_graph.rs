@@ -431,3 +431,141 @@ fn dynamic_group_with_store_supports_non_ord_hashmap_key() {
         "final price book (HashMap-backed, non-Ord key)"
     );
 }
+
+/// `Extension::combine` covers what the five original methods could not: a
+/// member built from *several* typed upstreams rather than filtered from one.
+/// Same schedule as `dynamic_group_maintains_a_live_price_book` — key 0 added at
+/// cycle 1 and deleted at cycle 4, key 1 added at cycle 2 — but now each key's
+/// own price is combined with a shared `forward` level that is not per-key
+/// state and ticks every cycle.
+///
+/// The per-cycle books pin the tick mask as well as the join: at cycle 3 key 1
+/// gathers only the forward (its own key did not quote) so the member still
+/// fires, while key 0 picks up both on cycle 2.
+#[test]
+fn dynamic_group_member_combines_a_per_key_stream_with_a_shared_one() {
+    use std::collections::BTreeMap;
+
+    let g = GraphBuilder::new();
+    let n = g.ticker(Duration::from_nanos(1)).count(); // 1, 2, 3, …
+    // Per-key feed: (key, price) with key alternating 1,0,… and price = 10*cycle.
+    let feed = n.map(|c: &u64| (c % 2, c * 10)).handle();
+    // A shared level that is explicitly not per-key state: forward = cycle.
+    let forward = n.map(|c: &u64| *c).handle();
+    // Same add/del schedule as the price-book oracle above.
+    let add = n
+        .map_filter(|c: &u64| ((if *c == 1 { 0u64 } else { 1 }), *c == 1 || *c == 2))
+        .handle();
+    let del = n
+        .map_filter(|c: &u64| ((if *c == 4 { 0u64 } else { 99 }), *c == 4 || *c == 5))
+        .handle();
+
+    let book = g.with_builder(|b| {
+        b.dynamic_group(
+            add,
+            del,
+            move |ext: &mut Extension<'_>, k: u64| {
+                // Each member selects its key's price and fans it in with the
+                // shared forward. Both are `u64`; the burst carries whichever
+                // ticked this cycle.
+                let mine = ext.filter_value(feed, move |(i, _): &(u64, u64)| *i == k);
+                let price = ext.map(mine, |(_, px): &(u64, u64)| *px);
+                let joined = ext.combine(&[price, forward]);
+                ext.map(joined, |b: &Burst<u64>| b.iter().sum::<u64>())
+            },
+            BTreeMap::<u64, u64>::new(),
+            |book: &mut BTreeMap<u64, u64>, key: &u64, v: &u64| {
+                book.insert(*key, *v);
+            },
+            |book: &mut BTreeMap<u64, u64>, key: &u64| {
+                book.remove(key);
+            },
+        )
+    });
+    let history = g.wrap(book).with_time().accumulate();
+
+    let mut runner = g.build();
+    runner
+        .run_dynamic(HISTORICAL, RunFor::Cycles(6), |_ext, _cycle| Ok(()))
+        .unwrap();
+
+    // key0 is live from cycle 2 and folds 20+2 before it is deleted at cycle 4
+    // (the delete drops it from the store before that cycle's fold). key1 is
+    // live from cycle 3 and adds the forward alone on cycles where its own key
+    // did not quote.
+    assert_eq!(
+        runner.value(history),
+        vec![
+            (NanoTime::new(1), BTreeMap::from([(0u64, 22u64)])),
+            (
+                NanoTime::new(2),
+                BTreeMap::from([(0u64, 3u64), (1u64, 33u64)])
+            ),
+            (NanoTime::new(3), BTreeMap::from([(1u64, 4u64)])),
+            (NanoTime::new(4), BTreeMap::from([(1u64, 55u64)])),
+            (NanoTime::new(5), BTreeMap::from([(1u64, 6u64)])),
+        ],
+        "per-cycle joined price book"
+    );
+}
+
+/// The fan-in boundary: `Extension::combine` accepts a one-element slice, the
+/// same shape `Builder::combine` does. The combined handle is read directly, so
+/// this pins the burst contents rather than a downstream reduction.
+#[test]
+fn extension_combine_of_one_source_gathers_a_single_value() {
+    let g = GraphBuilder::new();
+    let src = g.ticker(Duration::from_nanos(1)).count().handle();
+    let mut runner = g.build();
+
+    let mut combined = None;
+    runner
+        .run_dynamic(HISTORICAL, RunFor::Cycles(4), |ext, cycle| {
+            if cycle == 1 {
+                combined = Some(ext.combine(&[src]));
+            }
+            Ok(())
+        })
+        .unwrap();
+
+    // Appended at the end of cycle 1, so it fires on cycles 2..4; at cycle 4
+    // `src` holds 4 and the burst carries exactly that one value.
+    assert_eq!(
+        runner.value(combined.unwrap()),
+        Burst::from([4u64]),
+        "a one-source combine is a burst of one"
+    );
+}
+
+/// The tick mask holds on the dynamically appended path too: a `combine` member
+/// gathers only the sources that ticked this instant, so a fast-only cycle
+/// contributes one value and a shared instant contributes two. The shared
+/// periods are the same as `tests/combine_n.rs`'s mask oracle.
+#[test]
+fn extension_combine_gathers_only_the_sources_that_ticked() {
+    let g = GraphBuilder::new();
+    let fast = g.ticker(Duration::from_nanos(1)).count().handle();
+    let slow = g.ticker(Duration::from_nanos(3)).count().handle();
+    let mut runner = g.build();
+
+    let mut gathered = None;
+    runner
+        .run_dynamic(HISTORICAL, RunFor::Cycles(5), |ext, cycle| {
+            if cycle == 1 {
+                let joined = ext.combine(&[fast, slow]);
+                gathered =
+                    Some(ext.fold(joined, 0u64, |acc, b: &Burst<u64>| *acc += b.len() as u64));
+            }
+            Ok(())
+        })
+        .unwrap();
+
+    // Appended at the end of cycle 1, the member sees the instants t=1..4: three
+    // fast-only bursts of one, and t=3 where the slow ticker shares the instant
+    // for a burst of two.
+    assert_eq!(
+        runner.value(gathered.unwrap()),
+        5,
+        "four ticks, one of them shared"
+    );
+}
