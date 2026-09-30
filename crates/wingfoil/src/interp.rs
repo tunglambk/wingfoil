@@ -4107,10 +4107,16 @@ impl Extension<'_> {
     /// into one [`Burst`] in supplied order, and stays quiet on a cycle where
     /// none ticked.
     ///
-    /// Sources share one type, exactly as `Builder::combine`'s do, so a member
-    /// joining streams of different types maps them to a common type first. The
-    /// gather is tick-masked: a source that did not tick this instant is absent
+    /// Its **first** cycle is the exception. That is the cycle `recycle`
+    /// schedules for a freshly-spliced member, and like [`map`](Self::map) and
+    /// [`fold`](Self::fold) it reads state that may not have ticked: it gathers
+    /// every source's current value, so a factory built on a source that is
+    /// quiet at insertion time still gets a first value. From the second cycle
+    /// on the gather is tick-masked, and a source that did not tick is absent
     /// from the burst rather than carrying its last value.
+    ///
+    /// Sources share one type, exactly as `Builder::combine`'s do, so a member
+    /// joining streams of different types maps them to a common type first.
     pub fn combine<T>(&mut self, srcs: &[Handle<T>]) -> Handle<Burst<T>>
     where
         T: Clone + Default + 'static,
@@ -4120,25 +4126,27 @@ impl Extension<'_> {
         let slots: Vec<SlotRef<T>> = srcs.iter().map(|h| self.runner.rt_slot(*h)).collect();
         let out = self.runner.rt_new_slot(Burst::<T>::new());
         let ticked = self.runner.ticked.clone();
-        let gathered = indices.clone();
-        let cycle: CycleFn = Box::new(move |_k| {
-            let mut burst = Burst::<T>::new();
-            {
-                let t = ticked.borrow();
-                for (i, slot) in gathered.iter().zip(slots.iter()) {
-                    if t[*i] {
-                        burst.push(slot.borrow().clone());
-                    }
-                }
-            }
-            Ok(store_tick(CombineN::<T>::emit(burst), &out))
-        });
+        let first = Cell::new(true);
+        // Inlined, as `Builder::combine` is, so the node's index list can be
+        // passed by value ahead of the closure that moves it.
         self.runner.rt_append_node(
-            indices,
+            indices.clone(),
             Vec::new(),
             CombineN::<T>::ACTIVATION,
             "combine",
-            cycle,
+            Box::new(move |_k| {
+                let first_cycle = first.replace(false);
+                let mut burst = Burst::<T>::new();
+                {
+                    let t = ticked.borrow();
+                    for (i, slot) in indices.iter().zip(slots.iter()) {
+                        if first_cycle || t[*i] {
+                            burst.push(slot.borrow().clone());
+                        }
+                    }
+                }
+                Ok(store_tick(CombineN::<T>::emit(burst), &out))
+            }),
             Box::new(|_| Ok(())),
         );
         self.appended.push(idx);

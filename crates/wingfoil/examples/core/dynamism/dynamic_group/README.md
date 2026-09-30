@@ -26,6 +26,12 @@ b.dynamic_group(
 )
 ```
 
+A member isn't limited to filtering one stream. `Extension::combine` — the
+fan-in `Builder::combine` wires statically — gathers several upstreams into a
+`Burst`, so a per-instrument sub-graph can pull in a shared level alongside its
+own filtered feed. This example's member is the single-upstream shape; the
+fan-in is covered in `tests/dynamic_graph.rs`.
+
 The scenario comes from the shared [`market_data.rs`](../market_data.rs): a
 lifecycle ticker adds an instrument on two ticks out of three and deletes the
 oldest on the third, while a price ticker sweeps a sliding window of ids.
