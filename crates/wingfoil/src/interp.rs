@@ -4107,13 +4107,13 @@ impl Extension<'_> {
     /// into one [`Burst`] in supplied order, and stays quiet on a cycle where
     /// none ticked.
     ///
-    /// Its **first** cycle is the exception. That is the cycle `recycle`
-    /// schedules for a freshly-spliced member, and like [`map`](Self::map) and
-    /// [`fold`](Self::fold) it reads state that may not have ticked: it gathers
-    /// every source's current value, so a factory built on a source that is
-    /// quiet at insertion time still gets a first value. From the second cycle
-    /// on the gather is tick-masked, and a source that did not tick is absent
-    /// from the burst rather than carrying its last value.
+    /// Its **first** cycle also reads the sources that were already in the graph
+    /// whether or not they ticked then, so a member built over a quiet source
+    /// gets that source's current value on the `recycle` cycle, as
+    /// [`map`](Self::map) and [`fold`](Self::fold) do. A source appended in this
+    /// same scope contributes nothing until it first ticks: its slot still holds
+    /// only `Default`, and gathering that would be a value it never sent. From
+    /// the second cycle on the gather is tick-masked for every source.
     ///
     /// Sources share one type, exactly as `Builder::combine`'s do, so a member
     /// joining streams of different types maps them to a common type first.
@@ -4122,6 +4122,12 @@ impl Extension<'_> {
         T: Clone + Default + 'static,
     {
         let idx = self.runner.nodes.len();
+        // Sources that were in the graph before this scope, and so may already
+        // hold a value, versus ones appended here, which cannot have ticked yet.
+        let live: Vec<bool> = srcs
+            .iter()
+            .map(|h| !self.appended.contains(&h.idx))
+            .collect();
         let indices: Vec<usize> = srcs.iter().map(|h| h.idx).collect();
         let slots: Vec<SlotRef<T>> = srcs.iter().map(|h| self.runner.rt_slot(*h)).collect();
         let out = self.runner.rt_new_slot(Burst::<T>::new());
@@ -4139,8 +4145,8 @@ impl Extension<'_> {
                 let mut burst = Burst::<T>::new();
                 {
                     let t = ticked.borrow();
-                    for (i, slot) in indices.iter().zip(slots.iter()) {
-                        if first_cycle || t[*i] {
+                    for (n, (i, slot)) in indices.iter().zip(slots.iter()).enumerate() {
+                        if t[*i] || (first_cycle && live[n]) {
                             burst.push(slot.borrow().clone());
                         }
                     }
